@@ -1,0 +1,153 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package gfcp_pubsub
+
+import (
+	"context"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"reflect"
+	"sync"
+)
+
+import (
+	"github.com/dubbogo/grpc-go"
+	"github.com/dubbogo/grpc-go/codes"
+	"github.com/dubbogo/grpc-go/encoding"
+	"github.com/dubbogo/grpc-go/encoding/hessian"
+	"github.com/dubbogo/grpc-go/encoding/msgpack"
+	"github.com/dubbogo/grpc-go/encoding/raw_proto"
+	"github.com/dubbogo/grpc-go/status"
+
+	"github.com/opentracing/opentracing-go"
+)
+
+import (
+	"github.com/dubbogo/triple/pkg/common"
+	"github.com/dubbogo/triple/pkg/common/constant"
+	"github.com/dubbogo/triple/pkg/config"
+	"github.com/dubbogo/triple/pkg/tracing"
+)
+
+// TripleClient client endpoint that using triple protocol
+type TripleClient struct {
+	stubInvoker reflect.Value
+
+	triplConn *TripleConn
+
+	//once is used when destroy
+	once sync.Once
+
+	// triple config
+	opt *config.Option
+
+	// serializer is triple serializer to do codec
+	serializer encoding.Codec
+}
+
+// NewTripleClient creates triple client
+// it returns tripleClient, which contains invoker and triple connection.
+// @impl must have method: GetDubboStub(cc *dubbo3.TripleConn) interface{}, to be capable with grpc
+// @opt is used to init http2 controller, if it's nil, use the default config
+func NewTripleClient(impl interface{}, opt *config.Option) (*TripleClient, error) {
+	if opt == nil {
+		opt = config.NewTripleOption()
+	}
+	tripleClient := &TripleClient{
+		opt: opt,
+	}
+	dialOpts := []grpc.DialOption{}
+	if opt.JaegerAddress != "" {
+		var tracer opentracing.Tracer
+		if !opt.JaegerUseAgent {
+			tracer = tracing.NewJaegerTracerDirect(opt.JaegerServiceName, opt.JaegerAddress, opt.Logger)
+		} else {
+			tracer = tracing.NewJaegerTracerAgent(opt.JaegerServiceName, opt.JaegerAddress, opt.Logger)
+		}
+
+		dialOpts = append(dialOpts,
+			grpc.WithUnaryInterceptor(tracing.OpenTracingClientInterceptor(tracer)),
+			grpc.WithStreamInterceptor(tracing.OpenTracingStreamClientInterceptor(tracer)),
+		)
+	}
+
+	defaultCallOpts := make([]grpc.CallOption, 0)
+	// max send/receive size
+	if opt.GRPCMaxCallSendMsgSize != 0 {
+		defaultCallOpts = append(defaultCallOpts, grpc.MaxCallSendMsgSize(opt.GRPCMaxCallSendMsgSize))
+	}
+	if opt.GRPCMaxCallRecvMsgSize != 0 {
+		defaultCallOpts = append(defaultCallOpts, grpc.MaxCallRecvMsgSize(opt.GRPCMaxCallRecvMsgSize))
+	}
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(defaultCallOpts...))
+	tripleClient.triplConn = newTripleConn(int(opt.Timeout), opt.Location, dialOpts...)
+	return tripleClient, nil
+}
+
+// Invoke call remote using stub
+func (t *TripleClient) Invoke(methodName string, in []reflect.Value, reply interface{}) common.ErrorWithAttachment {
+	t.opt.Logger.Debugf("TripleClient.Invoke: methodName = %s, inputValue = %+v, expected reply struct = %+v, client defined codec = %s",
+		methodName, in, reply, t.opt.CodecType)
+	attachment := make(common.DubboAttachment)
+	if t.opt.CodecType == constant.PBCodecName {
+		out := new(emptypb.Empty)
+		ctx := in[0].Interface().(context.Context)
+		interfaceKey := ctx.Value(constant.InterfaceKey).(string)
+		t.triplConn.Invoke(ctx, "/"+interfaceKey+"/"+methodName, in[1].Interface(), out)
+	} else {
+		ctx := in[0].Interface().(context.Context)
+		interfaceKey := ctx.Value(constant.InterfaceKey).(string)
+		t.opt.Logger.Debugf("TripleClient.Invoke: call with interfaceKey = %s", interfaceKey)
+		reqParams := make([]interface{}, 0, len(in)-1)
+		for idx, v := range in {
+			if idx > 0 {
+				reqParams = append(reqParams, v.Interface())
+			}
+		}
+
+		var innerCodec encoding.Codec
+		var err error
+		switch t.opt.CodecType {
+		case constant.HessianCodecName:
+			innerCodec = hessian.NewHessianCodec()
+		case constant.MsgPackCodecName:
+			innerCodec = msgpack.NewMsgPackCodec()
+		default:
+			innerCodec, err = common.GetTripleCodec(t.opt.CodecType)
+			if err != nil {
+				return *common.NewErrorWithAttachment(status.Errorf(codes.Unimplemented, "TripleClient.Invoke: serialization %s not impl in triple client api.", t.opt.CodecType), attachment)
+			}
+		}
+		return t.triplConn.Invoke(ctx, "/"+interfaceKey+"/"+methodName, reqParams, reply, grpc.ForceCodec(
+			encoding.NewPBWrapperTwoWayCodec(string(t.opt.CodecType), innerCodec, raw_proto.NewProtobufCodec())))
+	}
+	return *common.NewErrorWithAttachment(nil, attachment)
+}
+
+// Close destroy http controller and return
+func (t *TripleClient) Close() {
+	t.opt.Logger.Debug("Triple Client Is closing")
+	if t.triplConn != nil && t.triplConn.grpcConn != nil {
+		t.triplConn.grpcConn.Close()
+	}
+}
+
+// IsAvailable returns if triple client is available
+func (t *TripleClient) IsAvailable() bool {
+	return true
+}
