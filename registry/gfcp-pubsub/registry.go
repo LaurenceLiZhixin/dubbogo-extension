@@ -12,16 +12,24 @@ import (
 
 var localIP = ""
 
+const (
+	gfcpPubsubProtocol = "gfcp-pubsub"
+)
+
 func init() {
-	extension.SetRegistry("gfcp-pubsub", newGFCPPubSubRegistry)
+	extension.SetRegistry(gfcpPubsubProtocol, newGFCPPubSubRegistry)
 }
 
 // newGFCPPubSubRegistry will create new instance
 func newGFCPPubSubRegistry(url *common.URL) (registry.Registry, error) {
-	return &GFCPPubSubRegistry{}, nil
+	url.Protocol = gfcpPubsubProtocol
+	return &GFCPPubSubRegistry{
+		registryURL: url,
+	}, nil
 }
 
 type GFCPPubSubRegistry struct {
+	registryURL *common.URL
 }
 
 // Register will register the service @url to its polaris registry center.
@@ -40,9 +48,8 @@ func (pr *GFCPPubSubRegistry) Subscribe(url *common.URL, notifyListener registry
 	if role != common.CONSUMER {
 		return nil
 	}
-	redisUrl, _ := common.NewURL("gfcp-pubsub://redis-server:6379")
 	notifyListener.Notify(&registry.ServiceEvent{
-		Service: redisUrl,
+		Service: pr.registryURL,
 	})
 	return nil
 }

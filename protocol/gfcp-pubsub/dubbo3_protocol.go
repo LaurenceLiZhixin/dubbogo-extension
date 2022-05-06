@@ -77,7 +77,7 @@ func (dp *DubboProtocol) Export(invoker protocol.Invoker) protocol.Exporter {
 	serviceKey := url.ServiceKey()
 	exporter := NewDubboExporter(serviceKey, invoker, dp.ExporterMap(), dp.serviceMap)
 	dp.SetExporterMap(serviceKey, exporter)
-	logger.Infof("[Triple Protocol] Export service: %s", url.String())
+	logger.Infof("[GFCP-Pubsub Protocol] Export service: %s", url.String())
 
 	key := url.GetParam(constant.BeanNameKey, "")
 	var service interface{}
@@ -137,7 +137,7 @@ func (dp *DubboProtocol) Refer(url *common.URL) protocol.Invoker {
 		return nil
 	}
 	dp.SetInvokers(invoker)
-	logger.Infof("[Triple Protocol] Refer service: %s", url.String())
+	logger.Infof("[GFCP-Pubsub Protocol] Refer service: %s", url.String())
 	return invoker
 }
 
@@ -255,7 +255,7 @@ func (dp *DubboProtocol) openServer(url *common.URL, tripleCodecType tripleConst
 
 	_, ok = dp.ExporterMap().Load(url.ServiceKey())
 	if !ok {
-		panic("[DubboProtocol]" + url.Key() + "is not existing")
+		panic("[GFCP-Pubsub]" + url.Key() + "is not existing")
 	}
 
 	srv := NewTripleServer(dp.serviceMap, triOption)

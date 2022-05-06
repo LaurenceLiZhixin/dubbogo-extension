@@ -6,9 +6,9 @@ import (
 	"net"
 )
 
-func NewRedisListener() net.Listener {
+func NewRedisListener(address string) net.Listener {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     address,
 		Password: "", // no password set
 		DB:       0,  // use default DB
 	})

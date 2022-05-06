@@ -21,7 +21,6 @@ import (
 	"context"
 	"github.com/dubbogo/grpc-go/encoding/raw_proto"
 	"github.com/go-redis/redis/v8"
-	"reflect"
 	"time"
 )
 
@@ -70,7 +69,7 @@ func newTripleConn(timeout int, address string, opts ...grpc.DialOption) *Triple
 	defer cancel()
 	opts = append(opts, grpc.WithInsecure())
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     address,
 		Password: "", // no password set
 		DB:       0,  // use default DB
 	})
@@ -78,16 +77,4 @@ func newTripleConn(timeout int, address string, opts ...grpc.DialOption) *Triple
 		timeout: timeout,
 		rdb:     rdb,
 	}
-}
-
-// getInvoker return invoker that have service method
-func getInvoker(impl interface{}, conn *TripleConn) interface{} {
-	in := make([]reflect.Value, 0, 16)
-	in = append(in, reflect.ValueOf(conn))
-
-	method := reflect.ValueOf(impl).MethodByName("GetDubboStub")
-	res := method.Call(in)
-	// res[0] is a struct that contains SayHello method, res[0] is greeter Client in example
-	// it's SayHello methodwill call specific of conn's invoker.
-	return res[0].Interface()
 }

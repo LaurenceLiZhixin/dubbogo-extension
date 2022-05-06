@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"github.com/go-redis/redis/v8"
 	"log"
-	"net"
 	"reflect"
 	"sync"
 )
@@ -45,7 +44,6 @@ import (
 
 // TripleServer is the object that can be started and listening remote request
 type TripleServer struct {
-	lst           net.Listener
 	grpcServer    *RedisPubsubServer
 	rpcServiceMap *sync.Map
 	registeredKey map[string]bool
@@ -68,7 +66,7 @@ func NewTripleServer(serviceMap *sync.Map, opt *config.Option) *TripleServer {
 
 // Stop
 func (t *TripleServer) Stop() {
-	t.lst.Close()
+	t.grpcServer.Stop()
 }
 
 /*
@@ -208,6 +206,7 @@ type serviceInfo struct {
 
 type RedisPubsubServer struct {
 	serviceInfoMap map[string]*serviceInfo // service name -> service info
+	cancelMap      sync.Map
 }
 
 func (r *RedisPubsubServer) RegisterService(sd *grpc.ServiceDesc, ss interface{}) {
@@ -228,9 +227,9 @@ func (r *RedisPubsubServer) RegisterService(sd *grpc.ServiceDesc, ss interface{}
 	r.serviceInfoMap[sd.ServiceName] = info
 }
 
-func (r *RedisPubsubServer) Serve(listener net.Listener) {
+func (r *RedisPubsubServer) Serve(address string) {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     address,
 		Password: "", // no password set
 		DB:       0,  // use default DB
 	})
@@ -239,36 +238,45 @@ func (r *RedisPubsubServer) Serve(listener net.Listener) {
 	for interfaceName, serviceInfo := range r.serviceInfoMap {
 		for _, method := range serviceInfo.methods {
 			wg.Add(1)
-			sub := rdb.Subscribe(context.Background(), fmt.Sprintf("/%s/%s", interfaceName, method.MethodName))
-			go func(sub *redis.PubSub, methodHandler grpc.MethodDesc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			subscribeKey := fmt.Sprintf("/%s/%s", interfaceName, method.MethodName)
+			r.cancelMap.Store(subscribeKey, cancel)
+			subChan := rdb.Subscribe(ctx, subscribeKey).Channel()
+			go func(ctx context.Context, subChan <-chan *redis.Message, methodHandler grpc.MethodDesc, interfaceName string, serviceImpl interface{}) {
 				defer wg.Done()
 				for {
-					msg, err := sub.ReceiveMessage(context.Background())
-					if err != nil {
-						log.Println("gfcp-pubsub recv message event error = ", err)
-						continue
+					select {
+					case <-ctx.Done():
+						return
+					case msg := <-subChan:
+						d := []byte(msg.Payload)
+						df := func(v interface{}) error {
+							return raw_proto.NewProtobufCodec().Unmarshal(d, v)
+						}
+						ctx := context.Background()
+						ctx = context.WithValue(ctx, "XXX_TRIPLE_GO_METHOD_NAME", methodHandler.MethodName)
+						ctx = context.WithValue(ctx, "XXX_TRIPLE_GO_INTERFACE_NAME", interfaceName)
+						ctx = context.WithValue(ctx, "XXX_TRIPLE_GO_GENERIC_PAYLOAD", d)
+						_, err := methodHandler.Handler(serviceImpl, ctx, df, nil)
+						if err != nil {
+							log.Println("gfcp-pubsub handle event error = ", err)
+						}
 					}
-					d := []byte(msg.Payload)
-					df := func(v interface{}) error {
-						return raw_proto.NewProtobufCodec().Unmarshal(d, v)
-					}
-					ctx := context.Background()
-					ctx = context.WithValue(ctx, "XXX_TRIPLE_GO_METHOD_NAME", methodHandler.MethodName)
-					ctx = context.WithValue(ctx, "XXX_TRIPLE_GO_INTERFACE_NAME", interfaceName)
-					ctx = context.WithValue(ctx, "XXX_TRIPLE_GO_GENERIC_PAYLOAD", d)
-					_, err = methodHandler.Handler(serviceInfo.serviceImpl, ctx, df, nil)
-					if err != nil {
-						log.Println("gfcp-pubsub handle event error = ", err)
-					}
+
 				}
-			}(sub, *method)
+			}(ctx, subChan, *method, interfaceName, serviceInfo.serviceImpl)
 		}
 	}
 	wg.Wait()
 }
 
 func (r *RedisPubsubServer) Stop() {
-
+	r.cancelMap.Range(func(key, value interface{}) bool {
+		value.(context.CancelFunc)()
+		return true
+	})
+	r.serviceInfoMap = map[string]*serviceInfo{}
+	r.cancelMap = sync.Map{}
 }
 
 func newGrpcServerWithCodec(opt *config.Option) *RedisPubsubServer {
@@ -279,7 +287,6 @@ func newGrpcServerWithCodec(opt *config.Option) *RedisPubsubServer {
 
 // Start can start a triple server
 func (t *TripleServer) Start() {
-	lst := NewRedisListener()
 	grpcServer := newGrpcServerWithCodec(t.opt)
 	t.rpcServiceMap.Range(func(key, value interface{}) bool {
 		t.registeredKey[key.(string)] = true
@@ -298,8 +305,7 @@ func (t *TripleServer) Start() {
 		return true
 	})
 
-	go grpcServer.Serve(lst)
-	t.lst = lst
+	go grpcServer.Serve(t.opt.Location)
 	t.grpcServer = grpcServer
 }
 
@@ -314,9 +320,6 @@ func (t *TripleServer) RefreshService() {
 		return true
 	})
 	t.grpcServer.Stop()
-	t.lst.Close()
-	lst := NewRedisListener()
-	go grpcServer.Serve(lst)
+	go grpcServer.Serve(t.opt.Location)
 	t.grpcServer = grpcServer
-	t.lst = lst
 }
